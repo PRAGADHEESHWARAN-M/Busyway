@@ -1,4 +1,4 @@
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+const API_URL = import.meta.env.VITE_API_URL || "/api";
 export const BUS_ID = import.meta.env.VITE_BUS_ID || "BUS-01";
 
 async function get(path) {

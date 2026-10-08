@@ -2,8 +2,14 @@
 // normalizes error messages so components never need to touch raw Axios
 // error objects.
 import axios from 'axios';
+import { Capacitor } from '@capacitor/core';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api';
+const BACKEND_URL = 'https://busyway-ifk2.onrender.com/api';
+
+// On the web, '/api' is proxied to the Render backend by netlify.toml (and by
+// the Vite dev server). The native app has no proxy, so it calls Render directly.
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || (Capacitor.isNativePlatform() ? BACKEND_URL : '/api');
 
 const api = axios.create({ baseURL: API_BASE_URL });
 
