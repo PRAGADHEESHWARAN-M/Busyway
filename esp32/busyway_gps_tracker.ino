@@ -26,18 +26,18 @@
 // >>> CHANGE THESE BEFORE UPLOADING <<<
 
 // Wi-Fi credentials
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD  = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID     = "BUSyWay-Mobile";
+const char* WIFI_PASSWORD  = "busywaywayway";
 
 // Backend API endpoint — use your Render URL or localhost
 // Examples:
 //   Local:  "http://192.168.1.100:5000/api/location"
 //   Render: "https://busyway-api.onrender.com/api/location"
-const char* BACKEND_URL = "YOUR_BACKEND_URL";
+const char* BACKEND_URL = "https://busyway-ifk2.onrender.com/";
 
 // Bus ID from MongoDB — get it from GET /api/buses
 // Example: "6700abcd1234ef5678901234"
-const char* BUS_ID = "YOUR_BUS_OBJECT_ID";
+const char* BUS_ID = "700abcd1234ef5678901234";
 
 // How often to send GPS data (milliseconds)
 const unsigned long SEND_INTERVAL_MS = 5000;
