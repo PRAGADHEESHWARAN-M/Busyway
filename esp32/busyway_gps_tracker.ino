@@ -1,256 +1,347 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
 
 // =====================================================
-// BUSy Way - Smart Bus Tracking System
-// ESP32 + NEO-6M GPS + Buzzer
+// BUSy Way — Smart Bus Tracking System
+// ESP32 + NEO-6M GPS + Backend Integration + Buzzer
+// =====================================================
+//
+// This firmware:
+//   1. Connects to Wi-Fi
+//   2. Reads GPS coordinates from the NEO-6M module
+//   3. POSTs location data to the BUSy Way backend
+//   4. Parses the JSON response for arrival events
+//   5. Beeps the buzzer ONLY when the backend confirms
+//      a new stop arrival (server-authoritative detection)
+//
+// The local stop list is kept only for serial debug display.
+// All real arrival logic runs on the backend's hysteresis
+// state machine (30 m arrival, 45 m exit radius).
 // =====================================================
 
-// ---------------- GPS ----------------
+// ======================== CONFIG ========================
+// >>> CHANGE THESE BEFORE UPLOADING <<<
+
+// Wi-Fi credentials
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD  = "YOUR_WIFI_PASSWORD";
+
+// Backend API endpoint — use your Render URL or localhost
+// Examples:
+//   Local:  "http://192.168.1.100:5000/api/location"
+//   Render: "https://busyway-api.onrender.com/api/location"
+const char* BACKEND_URL = "http://192.168.1.100:5000/api/location";
+
+// Bus ID from MongoDB — get it from GET /api/buses
+// Example: "6700abcd1234ef5678901234"
+const char* BUS_ID = "YOUR_BUS_OBJECT_ID";
+
+// How often to send GPS data (milliseconds)
+const unsigned long SEND_INTERVAL_MS = 5000;
+
+// Wi-Fi reconnection timeout (milliseconds)
+const unsigned long WIFI_TIMEOUT_MS = 15000;
+
+// ======================== PINS ==========================
+
+#define GPS_RX     16    // ESP32 RX2 <- GPS TX
+#define GPS_TX     17    // ESP32 TX2 -> GPS RX
+#define BUZZER_PIN 25    // Active/passive buzzer
+#define LED_PIN     2    // Built-in LED for status
+
+// ======================== GPS ===========================
+
 TinyGPSPlus gps;
-HardwareSerial GPS(2);
+HardwareSerial gpsSerial(2);
 
-#define GPS_RX 16   // ESP32 RX2 <- GPS TX
-#define GPS_TX 17   // ESP32 TX2 -> GPS RX
+// ======================== TIMING ========================
 
-// ---------------- BUZZER ----------------
-#define BUZZER_PIN 25
+unsigned long lastSendTime    = 0;
+unsigned long lastGpsReport   = 0;
+bool          wifiConnected   = false;
+int           sendFailCount   = 0;
+const int     MAX_FAIL_BEFORE_RECONNECT = 5;
 
-// ---------------- SETTINGS ----------------
-#define STOP_RADIUS 30.0
-#define RESET_RADIUS 50.0
+// ======================== STATS =========================
 
-// =====================================================
-// BUS STOPS
-// Your original coordinates
-// =====================================================
-
-struct BusStop {
-  const char* name;
-  double latitude;
-  double longitude;
-};
-
-// Stop coordinates converted from DMS to decimal
-BusStop stops[] = {
-
-  // Stop 1
-  {
-    "Stop 1",
-    9.672833,
-    77.965611
-  },
-
-  // Stop 2
-  {
-    "Stop 2",
-    9.673528,
-    77.965472
-  },
-
-  // Stop 3
-  {
-    "Stop 3",
-    9.6734565,
-    77.9644618
-  }
-};
-
-const int TOTAL_STOPS = 3;
+unsigned long totalPingsSent   = 0;
+unsigned long totalPingsOk     = 0;
+unsigned long totalPingsFailed = 0;
+unsigned long totalArrivals    = 0;
 
 // =====================================================
-// VARIABLES
-// =====================================================
-
-// Stores whether each stop has already triggered
-bool stopTriggered[TOTAL_STOPS] = {
-  false,
-  false,
-  false
-};
-
-// Current stop
-int currentStop = -1;
-
-// Last detected stop
-int lastStop = -1;
-
-// =====================================================
-// BUZZER ALERT
+// BUZZER — three short beeps (server-confirmed arrival)
 // =====================================================
 
 void buzzerAlert() {
-
   Serial.println();
-  Serial.println("******************************");
-  Serial.println("       BUZZER ALERT");
-  Serial.println("******************************");
+  Serial.println(F("****** BUZZER ALERT — STOP ARRIVAL CONFIRMED ******"));
 
   for (int i = 0; i < 3; i++) {
-
     digitalWrite(BUZZER_PIN, HIGH);
-    delay(500);
-
+    delay(400);
     digitalWrite(BUZZER_PIN, LOW);
-    delay(300);
+    delay(250);
+  }
+
+  // Explicitly ensure buzzer is off after alert
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// =====================================================
+// STATUS LED PATTERNS
+// =====================================================
+
+void ledBlink(int count, int onMs, int offMs) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(LED_PIN, LOW);
+    delay(offMs);
   }
 }
 
 // =====================================================
-// CALCULATE DISTANCE
+// WI-FI CONNECTION
 // =====================================================
 
-double getDistance(
-  double currentLat,
-  double currentLon,
-  double stopLat,
-  double stopLon
-) {
+bool connectWifi() {
+  Serial.println();
+  Serial.print(F("[WiFi] Connecting to "));
+  Serial.print(WIFI_SSID);
 
-  return TinyGPSPlus::distanceBetween(
-    currentLat,
-    currentLon,
-    stopLat,
-    stopLon
-  );
-}
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-// =====================================================
-// FIND NEXT STOP
-// =====================================================
+  unsigned long startAttempt = millis();
 
-void showNextStop(int reachedStop) {
-
-  if (reachedStop < TOTAL_STOPS - 1) {
-
-    Serial.print("Next Stop: ");
-    Serial.println(stops[reachedStop + 1].name);
-
-  } else {
-
-    Serial.println("Next Stop: Route Completed");
-  }
-}
-
-// =====================================================
-// CHECK ALL STOPS
-// =====================================================
-
-void checkStops(double busLat, double busLon) {
-
-  for (int i = 0; i < TOTAL_STOPS; i++) {
-
-    double distance = getDistance(
-      busLat,
-      busLon,
-      stops[i].latitude,
-      stops[i].longitude
-    );
-
-    Serial.print(stops[i].name);
-    Serial.print(" Distance: ");
-    Serial.print(distance, 1);
-    Serial.println(" m");
-
-
-    // ==========================================
-    // BUS HAS REACHED THE STOP
-    // ==========================================
-
-    if (distance <= STOP_RADIUS) {
-
-      currentStop = i;
-
-      // Trigger only once
-      if (!stopTriggered[i]) {
-
-        Serial.println();
-        Serial.println("================================");
-        Serial.print(" BUS REACHED: ");
-        Serial.println(stops[i].name);
-        Serial.println("================================");
-
-        Serial.print("Bus Number: BUS-01");
-        Serial.println();
-
-        Serial.print("Latitude: ");
-        Serial.println(busLat, 6);
-
-        Serial.print("Longitude: ");
-        Serial.println(busLon, 6);
-
-        Serial.print("Distance from Stop: ");
-        Serial.print(distance, 1);
-        Serial.println(" m");
-
-        // Buzzer
-        buzzerAlert();
-
-        // Notification message
-        Serial.println();
-        Serial.println("NOTIFICATION");
-        Serial.print("BUS-01 has reached ");
-        Serial.println(stops[i].name);
-
-        // Show next stop
-        showNextStop(i);
-
-        Serial.println("================================");
-        Serial.println();
-
-        // Mark stop as triggered
-        stopTriggered[i] = true;
-
-        lastStop = i;
-      }
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - startAttempt > WIFI_TIMEOUT_MS) {
+      Serial.println(F("\n[WiFi] Connection FAILED — timeout"));
+      ledBlink(5, 100, 100);  // Fast blink = error
+      return false;
     }
-
-    // ==========================================
-    // BUS HAS MOVED AWAY
-    // ==========================================
-
-    else if (distance > RESET_RADIUS) {
-
-      stopTriggered[i] = false;
-    }
+    Serial.print(".");
+    delay(500);
   }
-}
-
-// =====================================================
-// DISPLAY GPS INFORMATION
-// =====================================================
-
-void displayGPS() {
-
-  double latitude = gps.location.lat();
-  double longitude = gps.location.lng();
 
   Serial.println();
-  Serial.println("--------------------------------");
+  Serial.print(F("[WiFi] Connected! IP: "));
+  Serial.println(WiFi.localIP());
 
-  Serial.print("Bus Latitude : ");
-  Serial.println(latitude, 6);
+  // Solid LED for 1 second = connected
+  ledBlink(1, 1000, 0);
 
-  Serial.print("Bus Longitude: ");
-  Serial.println(longitude, 6);
+  return true;
+}
+
+void ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    return;
+  }
+
+  wifiConnected = false;
+  Serial.println(F("[WiFi] Disconnected — attempting reconnection..."));
+  wifiConnected = connectWifi();
+}
+
+// =====================================================
+// EXTRACT arrivalEvent FROM JSON RESPONSE
+// =====================================================
+// Lightweight parser — avoids pulling in ArduinoJson.
+// Looks for "arrivalEvent":null  vs  "arrivalEvent":{...}
+// If an arrival is found, extracts the "message" field.
+
+bool parseArrivalEvent(const String& json, String& message) {
+  // Check if arrivalEvent is null or missing
+  int idx = json.indexOf("\"arrivalEvent\"");
+  if (idx < 0) return false;
+
+  // Skip past "arrivalEvent":
+  idx = json.indexOf(':', idx);
+  if (idx < 0) return false;
+  idx++;
+
+  // Skip whitespace
+  while (idx < (int)json.length() && (json[idx] == ' ' || json[idx] == '\t')) idx++;
+
+  // null means no arrival
+  if (json.substring(idx, idx + 4) == "null") return false;
+
+  // Look for "message":"..."
+  int msgKey = json.indexOf("\"message\"", idx);
+  if (msgKey < 0) return false;
+
+  int colon = json.indexOf(':', msgKey);
+  if (colon < 0) return false;
+
+  int quoteStart = json.indexOf('"', colon + 1);
+  if (quoteStart < 0) return false;
+
+  int quoteEnd = json.indexOf('"', quoteStart + 1);
+  if (quoteEnd < 0) return false;
+
+  message = json.substring(quoteStart + 1, quoteEnd);
+  return true;
+}
+
+// =====================================================
+// SEND GPS DATA TO BACKEND
+// =====================================================
+
+void sendLocationToBackend(double lat, double lng, double speedKmh, int sats) {
+  if (!wifiConnected) {
+    Serial.println(F("[HTTP] Skipping — Wi-Fi not connected"));
+    return;
+  }
+
+  totalPingsSent++;
+  Serial.println();
+  Serial.println(F("─── Sending GPS Ping ───"));
+  Serial.print(F("  Lat: ")); Serial.println(lat, 6);
+  Serial.print(F("  Lng: ")); Serial.println(lng, 6);
+  Serial.print(F("  Speed: ")); Serial.print(speedKmh, 1); Serial.println(F(" km/h"));
+  Serial.print(F("  Sats: ")); Serial.println(sats);
+
+  // Build JSON body
+  String body = "{\"busId\":\"";
+  body += BUS_ID;
+  body += "\",\"latitude\":";
+  body += String(lat, 6);
+  body += ",\"longitude\":";
+  body += String(lng, 6);
+  body += ",\"speed\":";
+  body += String(speedKmh, 1);
+  body += ",\"satellites\":";
+  body += String(sats);
+  body += "}";
+
+  // Determine HTTP vs HTTPS
+  bool isHttps = String(BACKEND_URL).startsWith("https");
+
+  HTTPClient http;
+
+  if (isHttps) {
+    WiFiClientSecure* secureClient = new WiFiClientSecure();
+    // For first deployment / demo — skip certificate verification.
+    // For production, replace with: secureClient->setCACert(caCert);
+    secureClient->setInsecure();
+    http.begin(*secureClient, BACKEND_URL);
+  } else {
+    http.begin(BACKEND_URL);
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(10000);  // 10 second timeout
+
+  int httpCode = http.POST(body);
+
+  if (httpCode > 0) {
+    String response = http.getString();
+
+    Serial.print(F("  HTTP "));
+    Serial.print(httpCode);
+
+    if (httpCode == 201) {
+      // Location was stored
+      totalPingsOk++;
+      sendFailCount = 0;
+      Serial.println(F(" — Location saved ✓"));
+
+      // Check for arrival event
+      String arrivalMessage;
+      if (parseArrivalEvent(response, arrivalMessage)) {
+        totalArrivals++;
+        Serial.println();
+        Serial.println(F("╔══════════════════════════════════════╗"));
+        Serial.print(F("║  ARRIVAL: "));
+        Serial.println(arrivalMessage);
+        Serial.println(F("╚══════════════════════════════════════╝"));
+
+        // Server confirmed a new stop arrival — beep!
+        buzzerAlert();
+      }
+
+    } else if (httpCode == 202) {
+      // Demo mode active — ping acknowledged but not stored
+      Serial.println(F(" — Demo mode active (ping ignored)"));
+      sendFailCount = 0;
+
+    } else {
+      // Other status codes
+      totalPingsFailed++;
+      sendFailCount++;
+      Serial.print(F(" — Unexpected response: "));
+      Serial.println(response.substring(0, 200));
+    }
+
+  } else {
+    totalPingsFailed++;
+    sendFailCount++;
+    Serial.print(F("  HTTP Error: "));
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+
+  // If too many consecutive failures, try reconnecting Wi-Fi
+  if (sendFailCount >= MAX_FAIL_BEFORE_RECONNECT) {
+    Serial.println(F("[HTTP] Too many failures — reconnecting Wi-Fi..."));
+    WiFi.disconnect();
+    delay(1000);
+    ensureWifi();
+    sendFailCount = 0;
+  }
+}
+
+// =====================================================
+// SERIAL STATUS DISPLAY
+// =====================================================
+
+void printGpsStatus() {
+  double lat = gps.location.lat();
+  double lng = gps.location.lng();
+
+  Serial.println();
+  Serial.println(F("──────── GPS Status ────────"));
+  Serial.print(F("  Latitude : ")); Serial.println(lat, 6);
+  Serial.print(F("  Longitude: ")); Serial.println(lng, 6);
 
   if (gps.speed.isValid()) {
-
-    Serial.print("Speed        : ");
-    Serial.print(gps.speed.kmph());
-    Serial.println(" km/h");
+    Serial.print(F("  Speed    : "));
+    Serial.print(gps.speed.kmph(), 1);
+    Serial.println(F(" km/h"));
   }
 
   if (gps.satellites.isValid()) {
-
-    Serial.print("Satellites   : ");
+    Serial.print(F("  Satellites: "));
     Serial.println(gps.satellites.value());
   }
 
-  Serial.println("--------------------------------");
+  if (gps.hdop.isValid()) {
+    Serial.print(F("  HDOP     : "));
+    Serial.println(gps.hdop.hdop(), 1);
+  }
 
-  // Check stops
-  checkStops(latitude, longitude);
+  Serial.print(F("  WiFi     : "));
+  Serial.println(wifiConnected ? "Connected" : "Disconnected");
+
+  Serial.print(F("  Pings    : "));
+  Serial.print(totalPingsOk);
+  Serial.print(F(" OK / "));
+  Serial.print(totalPingsFailed);
+  Serial.print(F(" fail / "));
+  Serial.print(totalPingsSent);
+  Serial.println(F(" total"));
+
+  Serial.print(F("  Arrivals : "));
+  Serial.println(totalArrivals);
+
+  Serial.println(F("────────────────────────────"));
 }
 
 // =====================================================
@@ -258,74 +349,102 @@ void displayGPS() {
 // =====================================================
 
 void setup() {
-
+  // Serial monitor
   Serial.begin(115200);
+  delay(100);
 
-  // Start GPS
-  GPS.begin(
-    9600,
-    SERIAL_8N1,
-    GPS_RX,
-    GPS_TX
-  );
+  Serial.println();
+  Serial.println(F("══════════════════════════════════════════"));
+  Serial.println(F("     BUSy Way — Smart Bus Tracker"));
+  Serial.println(F("   ESP32 + NEO-6M GPS + Wi-Fi Client"));
+  Serial.println(F("══════════════════════════════════════════"));
 
-  // Buzzer
+  // Pin setup
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
+  // GPS UART — 9600 baud on Serial2 (GPIO 16 RX, GPIO 17 TX)
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println(F("[GPS]   UART started (9600 baud, RX=16, TX=17)"));
 
-  // Startup message
+  // Wi-Fi
+  wifiConnected = connectWifi();
+
+  // Config summary
   Serial.println();
-  Serial.println("==========================================");
-  Serial.println("       BUSy Way Smart Bus System");
-  Serial.println("==========================================");
-
-  Serial.println("ESP32 Started");
-  Serial.println("GPS Started");
-  Serial.println("Buzzer Started");
-
+  Serial.println(F("─── Configuration ───"));
+  Serial.print(F("  Backend : ")); Serial.println(BACKEND_URL);
+  Serial.print(F("  Bus ID  : ")); Serial.println(BUS_ID);
+  Serial.print(F("  Interval: ")); Serial.print(SEND_INTERVAL_MS / 1000); Serial.println(F("s"));
+  Serial.print(F("  WiFi    : ")); Serial.println(wifiConnected ? "Connected" : "Not connected");
   Serial.println();
-  Serial.println("Configured Bus Stops:");
-  Serial.println("1. Stop 1");
-  Serial.println("2. Stop 2");
-  Serial.println("3. Stop 3");
+  Serial.println(F("Waiting for GPS fix..."));
+  Serial.println(F("(Take the module to an open area for best reception)"));
+  Serial.println();
 
-  Serial.println();
-  Serial.print("Stop Detection Radius: ");
-  Serial.print(STOP_RADIUS);
-  Serial.println(" meters");
-
-  Serial.println();
-  Serial.println("Waiting for GPS fix...");
-  Serial.println("Take the GPS module to an open area.");
-  Serial.println();
+  // Startup beep — single short beep to confirm boot
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(150);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
 // =====================================================
-// LOOP
+// MAIN LOOP
 // =====================================================
 
 void loop() {
-
-  // Read all available GPS data
-  while (GPS.available()) {
-
-    gps.encode(GPS.read());
+  // ── 1. Feed GPS parser ──
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
   }
 
+  // ── 2. Process valid GPS fix ──
+  if (gps.location.isValid() && gps.location.isUpdated()) {
+    unsigned long now = millis();
 
-  // Check GPS location
-  if (gps.location.isValid()) {
+    // Print GPS status every 10 seconds
+    if (now - lastGpsReport >= 10000) {
+      printGpsStatus();
+      lastGpsReport = now;
+    }
 
-    displayGPS();
+    // Send to backend at configured interval
+    if (now - lastSendTime >= SEND_INTERVAL_MS) {
+      // Ensure Wi-Fi is alive
+      ensureWifi();
 
-    delay(2000);
-  }
+      double lat  = gps.location.lat();
+      double lng  = gps.location.lng();
+      double spd  = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+      int    sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
 
-  else {
+      sendLocationToBackend(lat, lng, spd, sats);
 
-    Serial.println("Waiting for GPS location...");
+      // Brief LED flash on each ping
+      ledBlink(1, 50, 0);
 
-    delay(1000);
+      lastSendTime = now;
+    }
+
+  } else {
+    // No GPS fix yet — print waiting message every 3 seconds
+    unsigned long now = millis();
+    if (now - lastGpsReport >= 3000) {
+      Serial.print(F("[GPS] Waiting for fix... chars processed: "));
+      Serial.print(gps.charsProcessed());
+
+      if (gps.charsProcessed() < 10) {
+        Serial.println(F("  ⚠ Check wiring! No data from GPS module."));
+      } else {
+        Serial.print(F("  sentences OK: "));
+        Serial.print(gps.sentencesWithFix());
+        Serial.print(F("  failed: "));
+        Serial.println(gps.failedChecksum());
+      }
+
+      lastGpsReport = now;
+    }
   }
 }
