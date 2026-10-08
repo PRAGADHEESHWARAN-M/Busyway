@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">BUSyWay-Mobile</string>
+    <string name="title_activity_main">BUSyWay-Mobile</string>
+    <string name="package_name">com.busyway.app</string>
+    <string name="custom_url_scheme">com.busyway.app</string>
+</resources>

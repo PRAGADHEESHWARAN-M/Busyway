@@ -1,0 +1,20 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  @apply bg-cream-50 text-forest-800;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+/* Leaflet default marker icons need explicit sizing when bundled via Vite */
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  border-radius: 1rem;
+  z-index: 0;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #c2a655; border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
