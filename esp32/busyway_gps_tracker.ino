@@ -33,7 +33,7 @@ const char* WIFI_PASSWORD  = "YOUR_WIFI_PASSWORD";
 // Examples:
 //   Local:  "http://192.168.1.100:5000/api/location"
 //   Render: "https://busyway-api.onrender.com/api/location"
-const char* BACKEND_URL = "http://192.168.1.100:5000/api/location";
+const char* BACKEND_URL = "YOUR_BACKEND_URL";
 
 // Bus ID from MongoDB — get it from GET /api/buses
 // Example: "6700abcd1234ef5678901234"
